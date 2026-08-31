@@ -798,6 +798,36 @@ async fn read_retries_short_main_data_page_read() {
     );
 }
 
+/// Declining under a pinned reader must be distinguishable from a pass that
+/// found nothing to reclaim.
+///
+/// Both come back `Ok` with every count at zero, so a caller deciding whether
+/// to retry — or an operator reading "0 pages reclaimed" off a maintenance
+/// endpoint — cannot tell "the store is already dense" from "compaction never
+/// ran". The flag is what separates them.
+#[tokio::test(flavor = "current_thread")]
+async fn compaction_says_when_a_pinned_reader_stopped_it() {
+    let db = Db::open_internal(MemVfs::new(), [9u8; 32], PAGE, REALM)
+        .await
+        .unwrap();
+
+    let quiet = db.compact_now().await.expect("compaction with no readers");
+    assert!(
+        !quiet.declined_readers_pinned,
+        "nothing pinned the range, so nothing declined"
+    );
+
+    let reader = db.begin_read().await.unwrap();
+    let declined = db.compact_now().await.expect("compaction under a reader");
+    assert!(
+        declined.declined_readers_pinned,
+        "a pinned reader stops compaction, and the result must say so"
+    );
+    assert_eq!(declined.main_db_pages_reclaimed, 0);
+    assert_eq!(declined.bytes_truncated, 0);
+    drop(reader);
+}
+
 #[tokio::test(flavor = "current_thread")]
 async fn compact_now_surfaces_live_segment_open_error_then_retry_succeeds() {
     let vfs = FailOnceVfs::new(MemVfs::new());
