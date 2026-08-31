@@ -68,6 +68,9 @@ async fn compact_now_inner<V: Vfs + Clone>(db: &Db<V>) -> Result<CompactStats> {
         !readers.is_empty()
     };
     if has_readers {
+        // Say so, rather than returning a zero result a caller cannot tell
+        // apart from "there was nothing to reclaim".
+        result.declined_readers_pinned = true;
         return Ok(result);
     }
 
