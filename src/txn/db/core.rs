@@ -45,6 +45,19 @@ pub(crate) struct TrackedReader {
     pub next_page_id: u64,
     pub catalog_root_page_id: u64,
     pub non_abortable: bool,
+    /// When the reader registered; feeds the oldest-reader age in `DbStats`.
+    /// `None` on wasm32, where `Instant::now()` panics.
+    pub began_at: Option<std::time::Instant>,
+}
+
+/// Monotonic timestamp for reader age. Always `None` on wasm32, where
+/// `std::time::Instant::now()` panics at runtime.
+pub(crate) fn monotonic_now() -> Option<std::time::Instant> {
+    if cfg!(target_arch = "wasm32") {
+        None
+    } else {
+        Some(std::time::Instant::now())
+    }
 }
 
 /// Writer state, guarded by the writer mutex. Holds the current root and
