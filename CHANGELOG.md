@@ -8,6 +8,7 @@ No version has been released yet. Pre-releases are published as `0.1.0-beta.N`; 
 
 ### Added
 
+- **Reader observability** — `DbStats` gains `oldest_reader_commit_id`, `oldest_reader_age_ms` (both `None` when no reader is registered; the age is also `None` on wasm32) and `reader_count_non_abortable` (`u32`), so a long-lived read transaction that holds back free-page reuse is visible from `Db::stats()`.
 - **B+ tree surface** — sorted `bytes → bytes` with copy-on-write shadow paging, A/B headers, ACID transactions, range scans, monotonic append, and bulk load. Reads return `Bytes` borrowed from the page cache; scans are bounded (`scan_from`, `scan_prefix_from`) or materialising.
 - **Segment File API** — engine-owned, append-mostly, atomically sealed encrypted files for formats that own their own layout (vectors, columnar blocks, FTS postings, R-trees).
 - **Encrypted pager** — every persistent page is authenticated; AES-256-GCM and ChaCha20-Poly1305 with per-page `cipher_id` for cipher agility. SIEVE page cache with bounded memory budgets.

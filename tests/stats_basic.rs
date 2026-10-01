@@ -138,3 +138,44 @@ async fn stats_reports_mode() {
         s.mode
     );
 }
+
+#[tokio::test]
+async fn stats_reports_oldest_reader_age() {
+    let db = fresh_db().await;
+    write_n(&db, 1).await;
+
+    let idle = db.stats().await.unwrap();
+    assert_eq!(idle.oldest_reader_commit_id, None);
+    assert_eq!(idle.oldest_reader_age_ms, None);
+    assert_eq!(idle.reader_count_non_abortable, 0);
+
+    let reader = db.begin_read().await.unwrap();
+    let pinned = reader.commit_id().value();
+    write_n(&db, 3).await;
+    let internal = db.begin_read_non_abortable().await.unwrap();
+    assert!(internal.commit_id().value() > pinned);
+    write_n(&db, 3).await;
+
+    let first = db.stats().await.unwrap();
+    assert_eq!(first.oldest_reader_commit_id, Some(pinned));
+    assert_eq!(first.reader_count_non_abortable, 1);
+    let first_age = first.oldest_reader_age_ms.expect("reader is pinned");
+
+    tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+    write_n(&db, 1).await;
+
+    let second = db.stats().await.unwrap();
+    assert_eq!(second.oldest_reader_commit_id, Some(pinned));
+    let second_age = second.oldest_reader_age_ms.expect("reader is pinned");
+    assert!(
+        second_age >= first_age + 10,
+        "age grew less than the 10 ms sleep: {first_age} -> {second_age}"
+    );
+
+    drop(reader);
+    drop(internal);
+    let drained = db.stats().await.unwrap();
+    assert_eq!(drained.oldest_reader_commit_id, None);
+    assert_eq!(drained.oldest_reader_age_ms, None);
+    assert_eq!(drained.reader_count_non_abortable, 0);
+}
