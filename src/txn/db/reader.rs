@@ -93,6 +93,7 @@ impl<V: Vfs + Clone> Db<V> {
             next_page_id,
             catalog_root_page_id,
             non_abortable,
+            began_at: super::core::monotonic_now(),
         });
         drop(readers);
         #[cfg(test)]
