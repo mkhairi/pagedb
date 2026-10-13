@@ -93,12 +93,22 @@ struct Node {
     /// not pay a second hash to pin, nor a third to unpin on drop.
     pins: u32,
     visited: bool,
+    /// Whether the node is on the SIEVE list. A dirty node is off it: dirty
+    /// pages are never evicted, so the hand has no reason to visit them.
+    linked: bool,
     prev: Option<usize>,
     next: Option<usize>,
 }
 
-/// Bounded page cache with SIEVE eviction. Pinned and dirty entries are
-/// skipped by the eviction hand.
+/// Bounded page cache with SIEVE eviction. Dirty entries leave the SIEVE
+/// list until they are clean again, and pinned entries are skipped by the
+/// eviction hand.
+///
+/// A large write transaction leaves most of the cache dirty. With dirty
+/// entries on the list, each eviction walked past every one of them to reach
+/// the few clean pages, so the inserts of one transaction cost time quadratic
+/// in the pages it wrote: 5-14 minutes for one rebasing CRDT flush of a few
+/// hundred megabytes.
 pub struct PageCache {
     capacity: usize,
     /// Keys are `(FileKey, u64)` page identities, never attacker-chosen in a
@@ -240,24 +250,54 @@ impl PageCache {
             page,
             pins: 0,
             visited: false,
-            prev: self.head,
+            linked: false,
+            prev: None,
             next: None,
         });
-        // Splice in as new head.
-        if let Some(old_head) = self.head {
+        self.map.insert(key, idx);
+        // Fresh entries are unpinned; a caller that pins or dirties this one
+        // adjusts the count through those paths. A key already marked dirty
+        // stays off the list until it is clean.
+        if !self.dirty.contains(&key) {
+            self.link_as_head(idx);
+            self.evictable += 1;
+        }
+        (evicted, idx)
+    }
+
+    /// Splice the unlinked node at `idx` in as the newest entry.
+    fn link_as_head(&mut self, idx: usize) {
+        let old_head = self.head;
+        {
+            let node = self.slab[idx].as_mut().expect("linked node alive");
+            debug_assert!(!node.linked, "node linked twice");
+            node.linked = true;
+            node.prev = old_head;
+            node.next = None;
+        }
+        if let Some(old_head) = old_head {
             self.slab[old_head].as_mut().expect("old head alive").next = Some(idx);
         } else {
             // Empty list; this node is also the new tail.
             self.tail = Some(idx);
         }
         self.head = Some(idx);
-        self.map.insert(key, idx);
-        // Fresh entries are clean and unpinned; a caller that pins or dirties
-        // this one adjusts the count through those paths.
-        if !self.dirty.contains(&key) {
-            self.evictable += 1;
+    }
+
+    /// Take the node at `idx` off the list, moving the hand off it first.
+    fn unlink_from_list(&mut self, idx: usize) {
+        let (prev, next) = {
+            let node = self.slab[idx].as_mut().expect("unlinked node alive");
+            if !node.linked {
+                return;
+            }
+            node.linked = false;
+            (node.prev.take(), node.next.take())
+        };
+        if self.hand == Some(idx) {
+            self.hand = next;
         }
-        (evicted, idx)
+        self.unlink_node(idx, prev, next);
     }
 
     fn evict_one(&mut self) -> Option<(FileKey, u64)> {
@@ -292,9 +332,11 @@ impl PageCache {
                 let node = self.slab[idx].as_ref().expect("hand on live node");
                 (node.key, node.next, node.visited, node.prev, node.pins)
             };
-            let pinned = pins > 0;
-            let is_dirty = self.dirty.contains(&key);
-            if pinned || is_dirty {
+            debug_assert!(
+                !self.dirty.contains(&key),
+                "a dirty page is on the SIEVE list"
+            );
+            if pins > 0 {
                 // Skip without touching the visited bit.
                 cur = next_idx;
                 continue;
@@ -308,6 +350,7 @@ impl PageCache {
             // so subsequent evictions resume from the right place.
             self.unlink_node(idx, prev_idx, next_idx);
             self.hand = next_idx;
+            self.slab[idx].as_mut().expect("hand on live node").linked = false;
             self.map.remove(&key);
             self.free_node(idx);
             self.evictable -= 1;
@@ -351,17 +394,24 @@ impl PageCache {
         let idx = self.map.get(&key).copied();
         let was_evictable = idx.is_some_and(|i| self.is_evictable(i));
         self.dirty.insert(key);
+        if let Some(idx) = idx {
+            self.unlink_from_list(idx);
+        }
         if was_evictable {
             self.evictable -= 1;
         }
     }
 
     pub fn clear_dirty(&mut self, key: (FileKey, u64)) {
-        self.dirty.remove(&key);
-        if let Some(idx) = self.map.get(&key).copied()
-            && self.is_evictable(idx)
-        {
-            self.evictable += 1;
+        if !self.dirty.remove(&key) {
+            return;
+        }
+        if let Some(idx) = self.map.get(&key).copied() {
+            // Back on the list as the newest entry: just written, so recent.
+            self.link_as_head(idx);
+            if self.is_evictable(idx) {
+                self.evictable += 1;
+            }
         }
     }
 
@@ -427,14 +477,7 @@ impl PageCache {
             if let Some(&idx) = self.map.get(&key) {
                 let was_evictable = self.is_evictable(idx);
                 self.map.remove(&key);
-                let (prev, next) = {
-                    let node = self.slab[idx].as_ref().expect("indexed node alive");
-                    (node.prev, node.next)
-                };
-                if self.hand == Some(idx) {
-                    self.hand = next;
-                }
-                self.unlink_node(idx, prev, next);
+                self.unlink_from_list(idx);
                 self.free_node(idx);
                 if was_evictable {
                     self.evictable -= 1;
@@ -682,5 +725,63 @@ mod tests {
         assert_eq!(c.len(), 5);
         assert!(c.get((FileKey::Main, 5)).is_none());
         assert!(c.get((FileKey::Main, 6)).is_some());
+    }
+
+    /// Dirty entries leave the SIEVE list, so eviction takes the clean ones
+    /// without visiting them, and an entry made clean is evictable again.
+    #[test]
+    fn dirty_entries_stay_off_the_eviction_list_until_clean() {
+        let mut c = PageCache::with_capacity(3);
+        for p in 1..=3u8 {
+            c.insert((FileKey::Main, u64::from(p)), page(p));
+        }
+        c.mark_dirty((FileKey::Main, 1));
+        c.mark_dirty((FileKey::Main, 2));
+        // Page 3 is the only clean entry, so it goes, not a dirty one.
+        assert_eq!(
+            c.insert((FileKey::Main, 4), page(4)),
+            Some((FileKey::Main, 3))
+        );
+
+        // Cleaned, page 1 rejoins as the newest entry: page 4 is older.
+        c.clear_dirty((FileKey::Main, 1));
+        assert_eq!(
+            c.insert((FileKey::Main, 5), page(5)),
+            Some((FileKey::Main, 4))
+        );
+        assert!(c.get((FileKey::Main, 2)).is_some(), "dirty page kept");
+
+        // A key marked dirty before it is cached is inserted off the list:
+        // the hand passes over it to the clean entries.
+        c.mark_dirty((FileKey::Main, 9));
+        assert_eq!(
+            c.insert((FileKey::Main, 9), page(9)),
+            Some((FileKey::Main, 1))
+        );
+        assert_eq!(
+            c.insert((FileKey::Main, 6), page(6)),
+            Some((FileKey::Main, 5))
+        );
+        assert!(c.get((FileKey::Main, 9)).is_some());
+        assert_eq!(c.dirty_len(), 2);
+    }
+
+    /// Dropping a file's entries takes dirty, unlinked ones too, and leaves
+    /// the list and the hand consistent for the next eviction.
+    #[test]
+    fn clearing_a_file_drops_unlinked_dirty_entries() {
+        let mut c = PageCache::with_capacity(2);
+        c.insert((FileKey::Main, 1), page(1));
+        c.insert((FileKey::Main, 2), page(2));
+        c.mark_dirty((FileKey::Main, 1));
+        c.clear_file(FileKey::Main);
+        assert_eq!(c.len(), 0);
+        assert_eq!(c.dirty_len(), 0);
+        c.insert((FileKey::Main, 3), page(3));
+        c.insert((FileKey::Main, 4), page(4));
+        assert_eq!(
+            c.insert((FileKey::Main, 5), page(5)),
+            Some((FileKey::Main, 3))
+        );
     }
 }
